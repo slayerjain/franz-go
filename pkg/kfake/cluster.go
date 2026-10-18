@@ -343,7 +343,8 @@ func (c *Cluster) ListenAddrs() []string {
 	return addrs
 }
 
-// Close shuts down the cluster.
+// Close shuts down the cluster. Cluster methods called after Close return
+// without doing anything.
 func (c *Cluster) Close() {
 	if c.dead.Swap(true) {
 		return
@@ -603,6 +604,16 @@ outer:
 		kresp, err, handled = c.tryControl(creq)
 		if handled {
 			goto afterControl
+		}
+
+		// While a control function runs, tryControlKey and the wakeCh
+		// case receive on adminCh, where Close can run its persist
+		// shutdown. Handling this request after that would change
+		// state that saveToDisk did not capture.
+		select {
+		case <-c.die:
+			return
+		default:
 		}
 
 		if c.cfg.enableSASL {
@@ -1314,10 +1325,22 @@ func (c *Cluster) admin(fn func()) {
 	}
 	c.whenMu.Unlock()
 
+	// After Close, run may have exited. We check die before sending
+	// because tryControlKey's loop still receives on adminCh after Close's
+	// persist shutdown runs there.
+	select {
+	case <-c.die:
+		return
+	default:
+	}
 	ofn := fn
 	wait := make(chan struct{})
 	fn = func() { ofn(); close(wait) }
-	c.adminCh <- fn
+	select {
+	case c.adminCh <- fn:
+	case <-c.die:
+		return
+	}
 	<-wait
 }
 
