@@ -1438,9 +1438,9 @@ func (cl *Client) close(ctx context.Context) (rerr error) {
 
 	// Tell the metrics loop to send its final Terminating=true push and
 	// give it 1s to do so. This must happen BEFORE we cancel the client
-	// context: the entire request path (shardedRequest's cancel watchdog,
-	// Broker.request's select, and the broker connection write/read
-	// loops) aborts requests once cl.ctx is dead, so a terminating push
+	// context: the entire request path (the dial, the broker connection
+	// write/read loops, and every wait between them; see connect) aborts
+	// requests once cl.ctx is dead, so a terminating push
 	// started after cancelation could never be delivered. The metrics
 	// loop cancels metrics.ctx when it exits; clients with metrics
 	// disabled, unsupported, or never observed pass through instantly.
@@ -1926,18 +1926,6 @@ func (cl *Client) RequestSharded(ctx context.Context, req kmsg.Request) []Respon
 type shardMerge func([]ResponseShard) (kmsg.Response, error)
 
 func (cl *Client) shardedRequest(ctx context.Context, req kmsg.Request) ([]ResponseShard, shardMerge) {
-	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		defer cancel()
-		select {
-		case <-done:
-		case <-ctx.Done():
-		case <-cl.ctx.Done():
-		}
-	}()
-
 	// First, handle any sharded request. This comes before the conditional
 	// below because this handles two group requests, which we do not want
 	// to fall into the handleCoordinatorReq logic.

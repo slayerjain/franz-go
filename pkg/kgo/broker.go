@@ -355,7 +355,8 @@ func (b *broker) issue(ctx context.Context, req kmsg.Request) *respWaiter {
 }
 
 // wait returns the request's resp and err, or the ctx error if the request's
-// ctx ends first.
+// ctx ends first. If the client has closed, a failed request returns
+// ErrClientClosed: the close is what failed it.
 //
 // handleReqs runs at the same time. Before handleReq claims our request, just
 // before it first touches req, handleReqs can spend a long time on the
@@ -376,6 +377,9 @@ func (w *respWaiter) wait() (kmsg.Response, error) {
 			return nil, w.ctx.Err()
 		}
 		<-w.done
+	}
+	if w.err != nil && w.cl.ctx.Err() != nil {
+		return nil, ErrClientClosed
 	}
 	return w.resp, w.err
 }
@@ -986,6 +990,16 @@ func (b *broker) reapConnections(idleTimeout time.Duration) (total int) {
 
 // connect connects to the broker's addr, returning the new connection.
 func (b *broker) connect(ctx context.Context) (net.Conn, error) {
+	// Close ends the dial. Every other wait on a request's path already
+	// ends at Close: the queued and in-flight requests are failed, the
+	// connection's deadline is set, and the remaining selects include
+	// the client ctx. So this is the one place that derives a ctx from
+	// the request ctx, once per connection rather than once per request.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(b.cl.ctx, cancel)
+	defer stop()
+
 	b.cl.cfg.logger.Log(LogLevelDebug, "opening connection to broker", "addr", b.addr, "broker", logID(b.meta.NodeID))
 	conn, err := b.cl.cfg.dialFn(ctx, "tcp", b.addr)
 	if err != nil {
