@@ -843,9 +843,9 @@ func (c *Cluster) Control(fn func(kmsg.Request) (kmsg.Response, error, bool)) {
 // If the control function returns true (handled), then either the response is
 // written back to the client or, if the control function returns an error, the
 // client connection is closed. If both returns are nil, then the cluster does
-// not reply and handles no further requests on that connection; the client
-// will likely have a read timeout at some point. An acks=0 produce has no
-// reply, so returning nil for one only drops it.
+// not reply to this request or any later request on that connection; the
+// client will likely have a read timeout at some point. An acks=0 produce has
+// no reply, so returning nil for one only drops it.
 //
 // If the control function returns false (not handled), the next control
 // function for this key runs. If no control function handles the request,
