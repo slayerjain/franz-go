@@ -431,8 +431,8 @@ func (b *broker) listen() {
 			return
 		}
 
-		mute := make(chan bool, 1)
-		mute <- true // first request proceeds immediately
+		mute := make(chan struct{}, 1)
+		mute <- struct{}{} // first request proceeds immediately
 		cc := &clientConn{
 			c:      b.c,
 			b:      b,
@@ -783,7 +783,7 @@ outer:
 			if asleep {
 				if c.cfg.sleepOutOfOrder && !creq.unmuted {
 					creq.unmuted = true
-					creq.cc.unmute(true)
+					creq.cc.unmute()
 				}
 				continue
 			}

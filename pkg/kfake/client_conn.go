@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kbin"
@@ -18,8 +19,10 @@ type (
 		conn   net.Conn
 		br     *bufio.Reader // buffers reads so a small request's size and body usually arrive in one read
 		respCh chan clientResp
-		done   chan struct{} // closed when read() returns
-		mute   chan bool     // capacity 1: serializes request processing per connection; false = stop reading
+		done   chan struct{} // closed when read() or write() returns, see closeDone
+		mute   chan struct{} // capacity 1: serializes request processing per connection
+
+		doneOnce sync.Once
 
 		saslStage saslStage
 		s0        *scramServer0
@@ -65,26 +68,19 @@ type (
 func (creq *clientReq) empty() bool { return creq == nil || creq.cc == nil || creq.kreq == nil }
 
 // unmute signals the read goroutine that it may submit the next request.
-// ok=true means the prior response was written successfully; ok=false
-// tells read to stop (the connection is dead).
-func (cc *clientConn) unmute(ok bool) {
-	if !ok {
-		// A request that slept with SleepOutOfOrder, or whose response
-		// write held behind an earlier one, released the mute already.
-		// If read has not taken it yet, mute is full, and read instead
-		// stops when write closes the conn.
-		select {
-		case cc.mute <- false:
-		default:
-		}
-		return
-	}
+func (cc *clientConn) unmute() {
 	select {
-	case cc.mute <- ok:
+	case cc.mute <- struct{}{}:
 	case <-cc.done:
 	case <-cc.c.die:
 	}
 }
+
+// closeDone closes done when read or write returns, whichever is first. Once
+// write returns, nothing drains respCh, so read and run's sends to respCh must
+// stop waiting on this connection. With SleepOutOfOrder, read can be about to
+// submit a request when write returns.
+func (cc *clientConn) closeDone() { cc.doneOnce.Do(func() { close(cc.done) }) }
 
 // reply sends a response back to the client, respecting connection close
 // and cluster shutdown. It returns false if the client will never see the
@@ -101,7 +97,7 @@ func (creq *clientReq) reply(kresp kmsg.Response) bool {
 }
 
 func (cc *clientConn) read() {
-	defer close(cc.done)
+	defer cc.closeDone()
 	defer cc.conn.Close()
 
 	// The cluster dying closes the connection, which is what returns us
@@ -154,20 +150,21 @@ func (cc *clientConn) read() {
 		// Wait until the previous request's response has been fully
 		// written before submitting the next. This matches the real
 		// Kafka broker's per-connection serial request processing.
-		// write() sends true after a successful write, false on error.
-		// The channel is pre-filled with true so the first request
-		// proceeds immediately.
+		// write() refills mute after a successful write and closes
+		// done when it returns. The channel is pre-filled so the
+		// first request proceeds immediately.
 		select {
-		case ok := <-cc.mute:
-			if !ok {
-				return
-			}
+		case <-cc.mute:
+		case <-cc.done:
+			return
 		case <-cc.c.die:
 			return
 		}
 		select {
 		case cc.c.reqCh <- &clientReq{cc: cc, kreq: kreq, at: time.Now(), cid: cid, corr: corr, seq: seq}:
 			seq++
+		case <-cc.done:
+			return
 		case <-cc.c.die:
 			return
 		}
@@ -175,6 +172,7 @@ func (cc *clientConn) read() {
 }
 
 func (cc *clientConn) write() {
+	defer cc.closeDone()
 	defer cc.conn.Close()
 
 	var (
@@ -187,7 +185,7 @@ func (cc *clientConn) write() {
 		// response until every earlier request is answered, and
 		// release its mute when we hold it so that read can submit
 		// the next request in the meantime.
-		oooresp = make(map[uint32]clientResp)
+		oooresp map[uint32]clientResp
 	)
 	for {
 		resp, ok := oooresp[seq]
@@ -204,7 +202,10 @@ func (cc *clientConn) write() {
 			if resp.seq != seq {
 				if !resp.unmuted {
 					resp.unmuted = true
-					cc.unmute(true)
+					cc.unmute()
+				}
+				if oooresp == nil {
+					oooresp = make(map[uint32]clientResp)
 				}
 				oooresp[resp.seq] = resp
 				continue
@@ -215,13 +216,12 @@ func (cc *clientConn) write() {
 		// that read() can submit the next request.
 		if resp.skip {
 			if !resp.unmuted {
-				cc.unmute(true)
+				cc.unmute()
 			}
 			continue
 		}
 		if err := resp.err; err != nil {
 			cc.c.cfg.logger.Logf(LogLevelInfo, "client %s request unable to be handled: %v", who, err)
-			cc.unmute(false)
 			return
 		}
 
@@ -234,13 +234,11 @@ func (cc *clientConn) write() {
 		binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)-4))
 		binary.BigEndian.PutUint32(buf[4:8], uint32(resp.corr))
 
-		_, err := cc.conn.Write(buf)
-		if err != nil {
-			cc.unmute(false)
+		if _, err := cc.conn.Write(buf); err != nil {
 			return
 		}
 		if !resp.unmuted {
-			cc.unmute(true)
+			cc.unmute()
 		}
 	}
 }
