@@ -53,7 +53,8 @@ type promisedReq struct {
 	ctx     context.Context
 	req     kmsg.Request
 	promise func(kmsg.Response, error)
-	enqueue time.Time // used to calculate writeWait
+	enqueue time.Time    // used to calculate writeWait
+	claimed *atomic.Bool // set by handleReq or respWaiter.wait, whichever is first; nil from do
 }
 
 type promisedResp struct {
@@ -308,12 +309,14 @@ func (b *broker) do(
 	req kmsg.Request,
 	promise func(kmsg.Response, error),
 ) {
-	pr := promisedReq{ctx, req, promise, time.Now()}
+	b.push(promisedReq{ctx: ctx, req: req, promise: promise, enqueue: time.Now()})
+}
 
+func (b *broker) push(pr promisedReq) {
 	first, dead := b.reqs.push(pr)
 
 	if dead {
-		promise(nil, errChosenBrokerDead)
+		pr.promise(nil, errChosenBrokerDead)
 	} else if first {
 		go b.handleReqs(pr)
 	}
@@ -321,16 +324,60 @@ func (b *broker) do(
 
 // waitResp runs a req, waits for the resp and returns the resp and err.
 func (b *broker) waitResp(ctx context.Context, req kmsg.Request) (kmsg.Response, error) {
-	var resp kmsg.Response
-	var err error
-	done := make(chan struct{})
-	wait := func(kresp kmsg.Response, kerr error) {
-		resp, err = kresp, kerr
-		close(done)
+	return b.issue(ctx, req).wait()
+}
+
+// respWaiter waits for the response to a request from issue.
+type respWaiter struct {
+	ctx     context.Context
+	cl      *Client
+	claimed atomic.Bool
+	done    chan struct{}
+	resp    kmsg.Response
+	err     error
+}
+
+// issue issues req and returns without waiting for its response, so that a
+// caller can issue requests to many brokers before waiting on any.
+func (b *broker) issue(ctx context.Context, req kmsg.Request) *respWaiter {
+	w := &respWaiter{ctx: ctx, cl: b.cl, done: make(chan struct{})}
+	b.push(promisedReq{
+		ctx: ctx,
+		req: req,
+		promise: func(resp kmsg.Response, err error) {
+			w.resp, w.err = resp, err
+			close(w.done)
+		},
+		enqueue: time.Now(),
+		claimed: &w.claimed,
+	})
+	return w
+}
+
+// wait returns the request's resp and err, or the ctx error if the request's
+// ctx ends first.
+//
+// handleReqs runs at the same time. Before handleReq claims our request, just
+// before it first touches req, handleReqs can spend a long time on the
+// requests ahead of ours, on our connection's dial, ApiVersions, and SASL, and
+// on reauthenticating our connection. If ctx ends before handleReq claims the
+// request, we claim it and return: handleReq then skips it, and a connection
+// that was already dialed still finishes ApiVersions and SASL and is kept.
+// Once handleReq claims the request, it may set the version on req or write
+// it, and the caller may reuse req once we return, so we wait for the promise.
+func (w *respWaiter) wait() (kmsg.Response, error) {
+	select {
+	case <-w.done:
+	case <-w.ctx.Done():
+		if w.claimed.CompareAndSwap(false, true) {
+			if w.cl.ctx.Err() != nil {
+				return nil, ErrClientClosed
+			}
+			return nil, w.ctx.Err()
+		}
+		<-w.done
 	}
-	b.do(ctx, req, wait)
-	<-done
-	return resp, err
+	return w.resp, w.err
 }
 
 // growStack grows a goroutine's stack while it has one frame. Our request
@@ -375,7 +422,7 @@ func (b *broker) handleReq(pr promisedReq) {
 start:
 	{
 		var err error
-		if cxn, err = b.loadConnection(pr.ctx, req); err != nil {
+		if cxn, err = b.loadConnection(pr); err != nil {
 			// It is rare, but it is possible that the broker has
 			// an immediate issue on a new connection. We retry
 			// once.
@@ -454,6 +501,13 @@ start:
 			pr.promise(nil, err)
 			return
 		}
+	}
+
+	if pr.claimed != nil {
+		if !pr.claimed.CompareAndSwap(false, true) {
+			return // respWaiter.wait returned on its ctx
+		}
+		pr.claimed = nil // a goto start retry must not claim again
 	}
 
 	v := b.loadVersions()
@@ -671,13 +725,13 @@ func (p bufPool) put(b []byte) { p.p.Put(&b) }
 
 // loadConnection returns the broker's connection, creating it if necessary
 // and returning an error of if that fails.
-func (b *broker) loadConnection(ctx context.Context, req kmsg.Request) (*brokerCxn, error) {
+func (b *broker) loadConnection(pr promisedReq) (*brokerCxn, error) {
 	var (
 		pcxn         = &b.cxnNormal
 		isProduceCxn bool
 		isFetchCxn   bool
-		reqKey       = req.Key()
-		_, isTimeout = req.(kmsg.TimeoutRequest)
+		reqKey       = pr.req.Key()
+		_, isTimeout = pr.req.(kmsg.TimeoutRequest)
 		reuse        = true
 	)
 	switch {
@@ -725,6 +779,13 @@ func (b *broker) loadConnection(ctx context.Context, req kmsg.Request) (*brokerC
 		return nil, errChosenBrokerDead
 	}
 
+	// Do not dial for a request whose ctx ended; respWaiter.wait may
+	// have returned already.
+	if err := pr.ctx.Err(); err != nil {
+		maybeUpdateCtxErr(b.cl.ctx, pr.ctx, &err)
+		return nil, err
+	}
+
 	var tries int
 doConnect:
 	tries++
@@ -733,7 +794,7 @@ doConnect:
 	// error, and duration (a backward goto over := re-executes the
 	// declaration; prior attempts' defers keep their own variables).
 	start := time.Now()
-	conn, err := b.connect(ctx)
+	conn, err := b.connect(pr.ctx)
 	defer func() {
 		since := time.Since(start)
 		b.cl.cfg.hooks.each(func(h Hook) {
