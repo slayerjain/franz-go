@@ -70,20 +70,20 @@ func TestSleepOutOfOrderSameConn(t *testing.T) {
 	c := newCluster(t, NumBrokers(1), SleepOutOfOrder())
 	cl := newPlainClient(t, c)
 
-	// The first ListGroups sleeps until the second, which kgo sends on
-	// the same connection, reaches the control. kgo fails a response
-	// with the wrong correlation ID, so both succeeding means the
-	// responses came back in order.
+	// The first ListGroups sleeps until two more, which kgo sends on the
+	// same connection, reach the control. kgo fails a response with the
+	// wrong correlation ID, so all succeeding means the responses came
+	// back in order.
 	var calls atomic.Int32
 	sleeping := make(chan struct{})
-	second := make(chan struct{})
+	third := make(chan struct{})
 	c.ControlKey(int16(kmsg.ListGroups), func(kmsg.Request) (kmsg.Response, error, bool) {
 		switch calls.Add(1) {
 		case 1:
 			close(sleeping)
-			c.SleepControl(func() { <-second })
-		case 2:
-			close(second)
+			c.SleepControl(func() { <-third })
+		case 3:
+			close(third)
 		}
 		return nil, nil, false
 	})
@@ -91,7 +91,7 @@ func TestSleepOutOfOrderSameConn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	b := cl.Broker(0)
-	errs := make(chan error, 2)
+	errs := make(chan error, 3)
 	list := func() {
 		_, err := b.Request(ctx, kmsg.NewPtrListGroupsRequest())
 		errs <- err
@@ -99,13 +99,14 @@ func TestSleepOutOfOrderSameConn(t *testing.T) {
 	go list()
 	waitCh(t, sleeping, "first ListGroups never reached the control")
 	go list()
-	for range 2 {
+	go list()
+	for range 3 {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}
 	}
-	if n := calls.Load(); n != 2 {
-		t.Errorf("control ran %d times for 2 requests", n)
+	if n := calls.Load(); n != 3 {
+		t.Errorf("control ran %d times for 3 requests", n)
 	}
 }
 

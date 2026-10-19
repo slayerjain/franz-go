@@ -69,9 +69,10 @@ func (creq *clientReq) empty() bool { return creq == nil || creq.cc == nil || cr
 // tells read to stop (the connection is dead).
 func (cc *clientConn) unmute(ok bool) {
 	if !ok {
-		// A request that slept with SleepOutOfOrder released the
-		// mute already. If read has not taken it yet, mute is full,
-		// and read instead stops when write closes the conn.
+		// A request that slept with SleepOutOfOrder, or whose response
+		// write held behind an earlier one, released the mute already.
+		// If read has not taken it yet, mute is full, and read instead
+		// stops when write closes the conn.
 		select {
 		case cc.mute <- false:
 		default:
@@ -183,7 +184,9 @@ func (cc *clientConn) write() {
 
 		// With SleepOutOfOrder, a request can be answered while an
 		// earlier request on this connection sleeps. We hold its
-		// response until every earlier request is answered.
+		// response until every earlier request is answered, and
+		// release its mute when we hold it so that read can submit
+		// the next request in the meantime.
 		oooresp = make(map[uint32]clientResp)
 	)
 	for {
@@ -199,6 +202,10 @@ func (cc *clientConn) write() {
 				return
 			}
 			if resp.seq != seq {
+				if !resp.unmuted {
+					resp.unmuted = true
+					cc.unmute(true)
+				}
 				oooresp[resp.seq] = resp
 				continue
 			}
