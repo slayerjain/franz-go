@@ -682,11 +682,23 @@ start:
 		noResp.Version = req.GetVersion()
 	}
 
-	corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeRequest(pr.ctx, pr.enqueue, req)
+	// Everything we read from req, before abandonOnCancel: once a cancel
+	// fails the request, the caller may reuse req.
+	key, version := req.Key(), req.GetVersion()
+	rt, wt := cxn.cl.connTimeouter.timeouts(req)
+	buf := cxn.cl.reqFormatter.AppendRequest(cxn.cl.bufPool.get()[:0], req, cxn.corrID)
+	var resp kmsg.Response
+	var flexibleHeader bool
+	if !isNoResp {
+		resp = req.ResponseKind()
+		flexibleHeader = req.IsFlexible() && key != 18 // response header not flexible if ApiVersions; see promisedResp doc
+	}
+
+	corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeBuf(pr.ctx, pr.enqueue, key, version, wt, buf)
 
 	if writeErr != nil {
 		cxn.die()
-		cxn.hookWriteE2E(req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
+		cxn.hookWriteE2E(key, bytesWritten, writeWait, timeToWrite, writeErr)
 		// If we wrote 0 bytes, the broker never saw the request.
 		// Safe to retry once on a new connection, same as the
 		// loadConnection retry above. Does not count against the
@@ -701,11 +713,9 @@ start:
 
 	if isNoResp {
 		pr.promise(noResp, nil)
-		cxn.hookWriteE2E(req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
+		cxn.hookWriteE2E(key, bytesWritten, writeWait, timeToWrite, writeErr)
 		return
 	}
-
-	rt, _ := cxn.cl.connTimeouter.timeouts(req)
 
 	ctx, promise := pr.ctx, pr.promise
 	if cxn.isNormalCxn {
@@ -714,8 +724,8 @@ start:
 	cxn.waitResp(promisedResp{
 		ctx,
 		corrID,
-		req.IsFlexible() && req.Key() != 18, // response header not flexible if ApiVersions; see promisedResp doc
-		req.ResponseKind(),
+		flexibleHeader,
+		resp,
 		promise,
 		rt,
 		bytesWritten,
@@ -1176,7 +1186,7 @@ start:
 		}
 	}
 	cxn.cl.cfg.logger.Log(LogLevelDebug, "issuing api versions request", "broker", logID(cxn.b.meta.NodeID), "version", maxVersion)
-	corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeRequest(nil, time.Now(), req)
+	corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeRequest(time.Now(), req)
 	if writeErr != nil {
 		cxn.hookWriteE2E(req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
 		return writeErr
@@ -1302,7 +1312,7 @@ start:
 		req.Mechanism = mechanism.Name()
 		req.Version = v.maxVersion(req.Key())
 		cxn.cl.cfg.logger.Log(LogLevelDebug, "issuing SASLHandshakeRequest", "broker", logID(cxn.b.meta.NodeID))
-		corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeRequest(nil, time.Now(), req)
+		corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeRequest(time.Now(), req)
 		if writeErr != nil {
 			cxn.hookWriteE2E(req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
 			return writeErr
@@ -1393,7 +1403,7 @@ func (cxn *brokerCxn) doSasl(authenticate bool) error {
 			// Lifetime: we take the timestamp before we write our
 			// request; see usage below for why.
 			prereq = time.Now()
-			corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeRequest(nil, time.Now(), req)
+			corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeRequest(time.Now(), req)
 			if writeErr != nil {
 				cxn.hookWriteE2E(req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
 				return writeErr
@@ -1505,25 +1515,27 @@ func maybeUpdateCtxErr(clientCtx, reqCtx context.Context, err *error) {
 
 // writeRequest writes a message request to the broker connection, bumping the
 // connection's correlation ID as appropriate for the next write.
-func (cxn *brokerCxn) writeRequest(ctx context.Context, enqueuedForWritingAt time.Time, req kmsg.Request) (corrID int32, bytesWritten int, writeWait, timeToWrite time.Duration, readEnqueue time.Time, writeErr error) {
-	buf := cxn.cl.reqFormatter.AppendRequest(
-		cxn.cl.bufPool.get()[:0],
-		req,
-		cxn.corrID,
-	)
-
+func (cxn *brokerCxn) writeRequest(enqueuedForWritingAt time.Time, req kmsg.Request) (corrID int32, bytesWritten int, writeWait, timeToWrite time.Duration, readEnqueue time.Time, writeErr error) {
+	buf := cxn.cl.reqFormatter.AppendRequest(cxn.cl.bufPool.get()[:0], req, cxn.corrID)
 	_, wt := cxn.cl.connTimeouter.timeouts(req)
+	return cxn.writeBuf(nil, enqueuedForWritingAt, req.Key(), req.GetVersion(), wt, buf)
+}
+
+// writeBuf writes an appended request and returns buf to the pool. handleReq
+// appends the request itself, before a cancel can hand req back to its
+// caller (see abandonOnCancel).
+func (cxn *brokerCxn) writeBuf(ctx context.Context, enqueuedForWritingAt time.Time, key, version int16, wt time.Duration, buf []byte) (corrID int32, bytesWritten int, writeWait, timeToWrite time.Duration, readEnqueue time.Time, writeErr error) {
 	bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr = cxn.writeConn(ctx, buf, wt, enqueuedForWritingAt)
 
 	cxn.cl.bufPool.put(buf)
 
 	cxn.cl.cfg.hooks.each(func(h Hook) {
 		if h, ok := h.(HookBrokerWrite); ok {
-			h.OnBrokerWrite(cxn.b.meta, req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
+			h.OnBrokerWrite(cxn.b.meta, key, bytesWritten, writeWait, timeToWrite, writeErr)
 		}
 	})
 	if logger := cxn.cl.cfg.logger; logger.Level() >= LogLevelDebug {
-		logger.Log(LogLevelDebug, fmt.Sprintf("wrote %s v%d", kmsg.NameForKey(req.Key()), req.GetVersion()), "broker", logID(cxn.b.meta.NodeID), "bytes_written", bytesWritten, "write_wait", writeWait, "time_to_write", timeToWrite, "err", writeErr)
+		logger.Log(LogLevelDebug, fmt.Sprintf("wrote %s v%d", kmsg.NameForKey(key), version), "broker", logID(cxn.b.meta.NodeID), "bytes_written", bytesWritten, "write_wait", writeWait, "time_to_write", timeToWrite, "err", writeErr)
 	}
 
 	if writeErr != nil {
